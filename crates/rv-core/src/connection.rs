@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Stable identity for a saved connection.
@@ -33,7 +34,7 @@ pub enum EncryptionMode {
     PreferOn,
     /// Require VeNCrypt TLS.
     Always,
-    /// Require VeNCrypt TLS without server certificate verification.
+    /// Require X509Plain and remember the server certificate on first use.
     Unverified,
     /// Never use VeNCrypt.
     Off,
@@ -45,7 +46,7 @@ impl EncryptionMode {
             Self::LetServerChoose => "Let server choose",
             Self::PreferOn => "Prefer on",
             Self::Always => "Always on",
-            Self::Unverified => "Unverified X509Plain",
+            Self::Unverified => "Trust X509Plain certificate",
             Self::Off => "Off",
         }
     }
@@ -189,6 +190,10 @@ pub struct ConnectRequest {
     pub quality: QualityPreset,
     pub view_only: bool,
     pub shared: bool,
+    /// Certificate accepted for this in-flight X509Plain attempt.
+    pub certificate_pin: Option<String>,
+    /// Per-connection certificate store; absent for an ad-hoc connection.
+    pub certificate_pin_path: Option<PathBuf>,
 }
 
 impl ConnectRequest {
@@ -204,6 +209,8 @@ impl ConnectRequest {
             quality: conn.quality,
             view_only: conn.view_only,
             shared: conn.shared,
+            certificate_pin: None,
+            certificate_pin_path: None,
         }
     }
 

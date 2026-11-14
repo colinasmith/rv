@@ -174,6 +174,26 @@ fn offscreen_disconnect_restores_cursor_and_stops_pointer_input(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn offscreen_changed_certificate_shows_trust_warning(cx: &mut TestAppContext) {
+    let (view, cx, peer) = setup(cx, false);
+    peer.events
+        .send(SessionEvent::CertificateTrustRequired {
+            fingerprint: "B".repeat(64),
+            previous: Some("A".repeat(64)),
+        })
+        .unwrap();
+    peer.events.send(SessionEvent::Disconnected).unwrap();
+    view.update(cx, |view, cx| view.pump(cx));
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.phase, Phase::Ended);
+        assert!(view.error.is_none());
+        let trust = view.certificate_trust.as_ref().unwrap();
+        assert_eq!(trust.fingerprint, "B".repeat(64));
+        assert_eq!(trust.previous.as_deref(), Some("A".repeat(64).as_str()));
+    });
+}
+
+#[gpui::test]
 fn offscreen_close_restores_cursor_and_closes_session(cx: &mut TestAppContext) {
     let (view, cx, mut peer) = setup(cx, false);
     cx.simulate_mouse_move(picture(&view, cx).center(), None, Modifiers::default());

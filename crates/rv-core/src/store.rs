@@ -63,6 +63,62 @@ impl StorePaths {
     pub fn thumb_path(&self, id: ConnectionId) -> PathBuf {
         self.thumbs.join(format!("{id}.png"))
     }
+
+    pub fn certificate_pin_path(&self, id: ConnectionId) -> PathBuf {
+        self.root.join("certificates").join(format!("{id}.json"))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CertificatePin {
+    host: String,
+    port: u16,
+    sha256: String,
+}
+
+/// A pin belongs to both the saved entry and its current network address.
+/// An edited host or port requires a fresh trust decision.
+pub fn load_certificate_pin(
+    path: &Path,
+    host: &str,
+    port: u16,
+) -> Result<Option<String>, StoreError> {
+    let stored: Option<CertificatePin> = read_json(path)?;
+    let Some(pin) = stored else {
+        return Ok(None);
+    };
+    if pin.sha256.len() != 64 || !pin.sha256.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid stored certificate fingerprint",
+        )));
+    }
+    Ok((pin.host.eq_ignore_ascii_case(host) && pin.port == port).then_some(pin.sha256))
+}
+
+pub fn save_certificate_pin(
+    path: &Path,
+    host: &str,
+    port: u16,
+    sha256: &str,
+) -> Result<(), StoreError> {
+    if sha256.len() != 64 || !sha256.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid certificate fingerprint",
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write(
+        path,
+        &serde_json::to_vec_pretty(&CertificatePin {
+            host: host.to_owned(),
+            port,
+            sha256: sha256.to_owned(),
+        })?,
+    )
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -149,6 +205,7 @@ impl AddressBook {
         }
         let thumb = self.paths.thumb_path(id);
         let _ = fs::remove_file(thumb);
+        let _ = fs::remove_file(self.paths.certificate_pin_path(id));
         let _ = delete_password(id);
         Ok(())
     }
@@ -306,6 +363,30 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn certificate_pin_is_bound_to_saved_address_and_validated() {
+        let path = std::env::temp_dir().join(format!(
+            "rv-cert-pin-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fingerprint = "A".repeat(64);
+        assert_eq!(load_certificate_pin(&path, "server", 5900).unwrap(), None);
+        save_certificate_pin(&path, "server", 5900, &fingerprint).unwrap();
+        assert_eq!(
+            load_certificate_pin(&path, "SERVER", 5900).unwrap(),
+            Some(fingerprint)
+        );
+        assert_eq!(load_certificate_pin(&path, "other", 5900).unwrap(), None);
+        assert_eq!(load_certificate_pin(&path, "server", 5901).unwrap(), None);
+        fs::write(&path, b"bad pin").unwrap();
+        assert!(load_certificate_pin(&path, "server", 5900).is_err());
+        fs::remove_file(path).unwrap();
+    }
 
     fn tmp_book() -> (AddressBook, tempfile_dir::Guard) {
         let guard = tempfile_dir::Guard::new();

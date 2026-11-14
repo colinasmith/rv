@@ -15,7 +15,9 @@ use gpui_component::{
 use image::{ImageBuffer, Rgba};
 use smallvec::SmallVec;
 
-use rv_core::{CAD_KEYSYMS, ConnectRequest, Keyboard, ScaleMode, XK_ALT_L, XK_CONTROL_L};
+use rv_core::{
+    CAD_KEYSYMS, ConnectRequest, Keyboard, ScaleMode, XK_ALT_L, XK_CONTROL_L, save_certificate_pin,
+};
 use rv_session::{SessionEvent, SessionHandle};
 
 use crate::actions::*;
@@ -72,6 +74,11 @@ enum Phase {
     Ended,
 }
 
+struct CertificateTrust {
+    fingerprint: String,
+    previous: Option<String>,
+}
+
 pub struct SessionView {
     req: ConnectRequest,
     handle: SessionHandle,
@@ -93,6 +100,7 @@ pub struct SessionView {
     fb_w: u16,
     fb_h: u16,
     error: Option<SharedString>,
+    certificate_trust: Option<CertificateTrust>,
     /// Where the remote picture was last painted, in window pixels. Filled
     /// in by a probe element so pointer mapping never guesses chrome sizes.
     image_box: Rc<Cell<Bounds<Pixels>>>,
@@ -171,6 +179,7 @@ impl SessionView {
             fb_w: 0,
             fb_h: 0,
             error: None,
+            certificate_trust: None,
             image_box: Rc::new(Cell::new(Bounds::default())),
             keys: Keyboard::new(),
             focus,
@@ -232,9 +241,19 @@ impl SessionView {
                     self.error = Some(e.clone().into());
                     self.status = e.into();
                 }
+                SessionEvent::CertificateTrustRequired {
+                    fingerprint,
+                    previous,
+                } => {
+                    self.certificate_trust = Some(CertificateTrust {
+                        fingerprint,
+                        previous,
+                    });
+                    self.status = "Certificate approval required".into();
+                }
                 SessionEvent::Disconnected => {
                     self.local_cursor.set_hidden(false);
-                    if self.error.is_none() {
+                    if self.error.is_none() && self.certificate_trust.is_none() {
                         self.status = "Disconnected".into();
                     }
                     self.phase = Phase::Ended;
@@ -424,6 +443,7 @@ impl SessionView {
         self.handle = SessionHandle::spawn(self.req.clone());
         self.phase = Phase::Connecting;
         self.error = None;
+        self.certificate_trust = None;
         self.status = "Connecting…".into();
         self.buttons = 0;
         self.last_generation = 0;
@@ -432,6 +452,22 @@ impl SessionView {
             cx.drop_image(old, None);
         }
         cx.notify();
+    }
+
+    fn trust_certificate(&mut self, cx: &mut Context<Self>) {
+        let Some(trust) = self.certificate_trust.as_ref() else {
+            return;
+        };
+        if let Some(path) = self.req.certificate_pin_path.as_ref()
+            && let Err(error) =
+                save_certificate_pin(path, &self.req.host, self.req.port, &trust.fingerprint)
+        {
+            self.error = Some(format!("Could not remember certificate: {error}").into());
+            cx.notify();
+            return;
+        }
+        self.req.certificate_pin = Some(trust.fingerprint.clone());
+        self.reconnect(cx);
     }
 
     fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -913,7 +949,8 @@ impl SessionView {
     }
 
     fn render_ended(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let failed = self.error.is_some();
+        let failed = self.error.is_some() || self.certificate_trust.is_some();
+        let trust = self.certificate_trust.as_ref();
         div()
             .id("session-ended")
             .occlude()
@@ -925,7 +962,7 @@ impl SessionView {
             .bg(theme::scrim())
             .child(
                 v_flex()
-                    .w(px(380.))
+                    .w(px(if trust.is_some() { 530. } else { 380. }))
                     .gap_3()
                     .p_5()
                     .rounded_lg()
@@ -950,17 +987,49 @@ impl SessionView {
                                     theme::muted(cx)
                                 }),
                             )
-                            .child(div().text_lg().font_semibold().child(if failed {
+                            .child(div().text_lg().font_semibold().child(if let Some(trust) = trust {
+                                if trust.previous.is_some() {
+                                    "Server certificate changed"
+                                } else {
+                                    "Trust server certificate?"
+                                }
+                            } else if failed {
                                 "Connection failed"
                             } else {
                                 "Disconnected"
                             })),
                     )
                     .child(div().text_sm().text_color(theme::muted(cx)).child(
-                        self.error.clone().unwrap_or_else(|| {
-                            format!("The session with {} has ended.", self.host()).into()
-                        }),
+                        if let Some(trust) = trust {
+                            if trust.previous.is_some() {
+                                "The certificate no longer matches the one saved for this server. No credentials were sent. Verify the new fingerprint before replacing the saved certificate.".into()
+                            } else {
+                                "This server's certificate is not yet trusted. Verify its fingerprint with the server administrator before continuing. No credentials were sent.".into()
+                            }
+                        } else {
+                            self.error.clone().unwrap_or_else(|| {
+                                format!("The session with {} has ended.", self.host()).into()
+                            })
+                        },
                     ))
+                    .when_some(trust, |card, trust| {
+                        card.child(
+                            v_flex()
+                                .gap_1()
+                                .text_sm()
+                                .child("SHA-256 fingerprint")
+                                .child(trust.fingerprint[..32].to_string())
+                                .child(trust.fingerprint[32..].to_string())
+                                .when_some(trust.previous.as_ref(), |this, previous| {
+                                    this.child("Previously trusted fingerprint")
+                                        .child(previous[..32].to_string())
+                                        .child(previous[32..].to_string())
+                                }),
+                        )
+                    })
+                    .when_some(self.error.as_ref().filter(|_| trust.is_some()), |card, error| {
+                        card.child(div().text_sm().text_color(theme::danger(cx)).child(error.clone()))
+                    })
                     .child(
                         h_flex()
                             .justify_end()
@@ -973,8 +1042,24 @@ impl SessionView {
                                 Button::new("ended-retry")
                                     .primary()
                                     .icon(IconName::Replace)
-                                    .label("Reconnect")
-                                    .on_click(cx.listener(|this, _, _, cx| this.reconnect(cx))),
+                                    .label(if let Some(trust) = trust {
+                                        if trust.previous.is_some() {
+                                            "Replace and reconnect"
+                                        } else if self.req.certificate_pin_path.is_some() {
+                                            "Trust and remember"
+                                        } else {
+                                            "Trust once"
+                                        }
+                                    } else {
+                                        "Reconnect"
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if this.certificate_trust.is_some() {
+                                            this.trust_certificate(cx);
+                                        } else {
+                                            this.reconnect(cx);
+                                        }
+                                    })),
                             ),
                     ),
             )

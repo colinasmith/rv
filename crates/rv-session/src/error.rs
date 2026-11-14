@@ -10,6 +10,11 @@ pub enum SessionError {
     Tls(String),
     #[error("connection timed out")]
     Timeout,
+    #[error("X509Plain certificate needs approval")]
+    CertificateTrust {
+        fingerprint: String,
+        previous: Option<String>,
+    },
     #[error("{0}")]
     Message(String),
 }

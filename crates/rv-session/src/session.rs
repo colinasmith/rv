@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rv_core::{ConnectRequest, EncryptionMode};
+use rv_core::{ConnectRequest, EncryptionMode, load_certificate_pin};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use vnc::{PixelFormat, VncConnector, VncEvent, X11Event};
@@ -31,11 +31,20 @@ const MAX_EVENTS_PER_SLOT: usize = 64;
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Status(String),
-    Connected { width: u16, height: u16 },
-    FrameReady { generation: u64 },
+    Connected {
+        width: u16,
+        height: u16,
+    },
+    FrameReady {
+        generation: u64,
+    },
     Clipboard(String),
     Bell,
     Error(String),
+    CertificateTrustRequired {
+        fingerprint: String,
+        previous: Option<String>,
+    },
     Disconnected,
 }
 
@@ -204,6 +213,16 @@ async fn run(
 
     match connect_and_loop(request, fb, &mut cmd_rx, &send).await {
         Ok(()) => send(SessionEvent::Disconnected),
+        Err(SessionError::CertificateTrust {
+            fingerprint,
+            previous,
+        }) => {
+            send(SessionEvent::CertificateTrustRequired {
+                fingerprint,
+                previous,
+            });
+            send(SessionEvent::Disconnected);
+        }
         Err(e) => {
             send(SessionEvent::Error(e.to_string()));
             send(SessionEvent::Disconnected);
@@ -326,6 +345,19 @@ async fn connect(
         }
         Transport::VeNCrypt => {
             send(SessionEvent::Status("Negotiating VeNCrypt…".into()));
+            let saved_pin = if request.encryption == EncryptionMode::Unverified {
+                match request.certificate_pin_path.as_ref() {
+                    Some(path) => {
+                        load_certificate_pin(path, &request.host, request.port).map_err(|e| {
+                            SessionError::msg(format!("Cannot read saved certificate: {e}"))
+                        })?
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let expected_pin = request.certificate_pin.as_deref().or(saved_pin.as_deref());
             timeout(
                 CONNECT_TIMEOUT,
                 vencrypt::handshake(
@@ -334,6 +366,7 @@ async fn connect(
                     request.username.as_deref(),
                     request.password.as_deref(),
                     request.encryption == EncryptionMode::Unverified,
+                    expected_pin,
                 ),
             )
             .await

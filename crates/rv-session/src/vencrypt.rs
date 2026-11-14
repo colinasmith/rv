@@ -255,6 +255,7 @@ pub async fn handshake(
     username: Option<&str>,
     password: Option<&str>,
     unverified: bool,
+    expected_pin: Option<&str>,
 ) -> Result<RfbStream, SessionError> {
     stream.write_u8(VENCRYPT_SECURITY_TYPE).await?;
 
@@ -318,6 +319,25 @@ pub async fn handshake(
     } else {
         Transport::Anonymous(Box::new(anonymous_tls(stream).await?))
     };
+    if unverified {
+        let Transport::UnverifiedCert(ref tls) = transport else {
+            unreachable!("unverified mode must select X509Plain");
+        };
+        let cert = tls.ssl().peer_certificate().ok_or_else(|| {
+            SessionError::Tls("X509Plain server did not present a certificate".into())
+        })?;
+        let fingerprint = cert
+            .digest(openssl::hash::MessageDigest::sha256())?
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        if expected_pin != Some(fingerprint.as_str()) {
+            return Err(SessionError::CertificateTrust {
+                fingerprint,
+                previous: expected_pin.map(str::to_owned),
+            });
+        }
+    }
     if auth == VencryptAuth::Plain {
         plain_auth(&mut transport, username.unwrap(), password.unwrap()).await?;
         Ok(RfbStream::authenticated_transport(transport))

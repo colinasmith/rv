@@ -497,7 +497,10 @@ impl AddressBookApp {
         .detach();
     }
 
-    fn launch(&mut self, req: ConnectRequest, cx: &mut Context<Self>) {
+    fn launch(&mut self, mut req: ConnectRequest, cx: &mut Context<Self>) {
+        req.certificate_pin_path = req
+            .connection_id
+            .map(|id| self.book.paths().certificate_pin_path(id));
         self.status = format!("Connecting to {}…", req.display_name()).into();
         let title = req.display_name().to_string();
         let prefs = self.book.prefs();
@@ -1483,7 +1486,7 @@ fn connection_options(app: &AddressBookApp, cx: &mut Context<AddressBookApp>) ->
                 .small()
                 .label(app.encryption.label())
                 .tooltip(if app.encryption == EncryptionMode::Unverified {
-                    "Unverified X509Plain encrypts traffic without verifying the server. Click to cycle."
+                    "Trust the X509Plain certificate on first use and warn if it changes. Click to cycle."
                 } else {
                     "Click to cycle"
                 })

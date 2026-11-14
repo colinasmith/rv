@@ -150,6 +150,8 @@ fn request_for(port: u16) -> ConnectRequest {
         quality: QualityPreset::Fast,
         view_only: false,
         shared: true,
+        certificate_pin: None,
+        certificate_pin_path: None,
     }
 }
 
@@ -432,22 +434,8 @@ fn x509_plain_unverified_authentication_frame_and_input() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let (pin_tx, pin_rx) = std::sync::mpsc::channel();
     let server = thread::spawn(move || {
-        let (mut sock, _) = listener.accept().unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        sock.set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        sock.write_all(b"RFB 003.008\n").unwrap();
-        assert_eq!(read_exact(&mut sock, 12), b"RFB 003.008\n");
-        sock.write_all(&[1, 19, 0, 2]).unwrap();
-        assert_eq!(read_exact(&mut sock, 1), [19]);
-        assert_eq!(read_exact(&mut sock, 2), [0, 2]);
-        sock.write_all(&[0, 2]).unwrap();
-        write_u32(&mut sock, 259);
-        write_u32(&mut sock, 262);
-        assert_eq!(read_exact(&mut sock, 4), 262u32.to_be_bytes());
-        sock.write_all(&[1]).unwrap();
-
         let mut builder = SslContext::builder(SslMethod::tls_server()).unwrap();
         let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
         let mut name = X509NameBuilder::new().unwrap();
@@ -463,8 +451,30 @@ fn x509_plain_unverified_authentication_frame_and_input() {
         cert.set_not_after(Asn1Time::days_from_now(1).unwrap().as_ref())
             .unwrap();
         cert.sign(&key, MessageDigest::sha256()).unwrap();
-        builder.set_certificate(&cert.build()).unwrap();
+        let cert = cert.build();
+        let fingerprint = cert
+            .digest(MessageDigest::sha256())
+            .unwrap()
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        pin_tx.send(fingerprint).unwrap();
+        builder.set_certificate(&cert).unwrap();
         builder.set_private_key(&key).unwrap();
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        sock.write_all(b"RFB 003.008\n").unwrap();
+        assert_eq!(read_exact(&mut sock, 12), b"RFB 003.008\n");
+        sock.write_all(&[1, 19, 0, 2]).unwrap();
+        assert_eq!(read_exact(&mut sock, 1), [19]);
+        assert_eq!(read_exact(&mut sock, 2), [0, 2]);
+        sock.write_all(&[0, 2]).unwrap();
+        write_u32(&mut sock, 259);
+        write_u32(&mut sock, 262);
+        assert_eq!(read_exact(&mut sock, 4), 262u32.to_be_bytes());
+        sock.write_all(&[1]).unwrap();
         let ssl = Ssl::new(&builder.build()).unwrap();
         let mut tls = SslStream::new(ssl, sock).unwrap();
         tls.accept().unwrap();
@@ -484,6 +494,7 @@ fn x509_plain_unverified_authentication_frame_and_input() {
     request.encryption = EncryptionMode::Unverified;
     request.username = Some("test-user".into());
     request.password = Some("test-password".into());
+    request.certificate_pin = Some(pin_rx.recv().unwrap());
     let handle = SessionHandle::spawn(request);
     assert!(
         wait_for(&handle, Duration::from_secs(5), |event| {
@@ -499,6 +510,79 @@ fn x509_plain_unverified_authentication_frame_and_input() {
     handle.key(0xff0d, true);
     server.join().unwrap();
     handle.close();
+}
+
+#[test]
+fn x509_plain_stops_before_credentials_for_new_or_changed_certificate() {
+    use openssl::asn1::Asn1Time;
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+    use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream};
+    use openssl::x509::{X509, X509NameBuilder};
+
+    for old_pin in [None, Some("A".repeat(64))] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            sock.write_all(b"RFB 003.008\n").unwrap();
+            assert_eq!(read_exact(&mut sock, 12), b"RFB 003.008\n");
+            sock.write_all(&[1, 19, 0, 2]).unwrap();
+            assert_eq!(read_exact(&mut sock, 1), [19]);
+            assert_eq!(read_exact(&mut sock, 2), [0, 2]);
+            sock.write_all(&[0, 1]).unwrap();
+            write_u32(&mut sock, 262);
+            assert_eq!(read_exact(&mut sock, 4), 262u32.to_be_bytes());
+            sock.write_all(&[1]).unwrap();
+
+            let mut builder = SslContext::builder(SslMethod::tls_server()).unwrap();
+            let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+            let mut name = X509NameBuilder::new().unwrap();
+            name.append_entry_by_text("CN", "self-signed").unwrap();
+            let name = name.build();
+            let mut cert = X509::builder().unwrap();
+            cert.set_version(2).unwrap();
+            cert.set_subject_name(&name).unwrap();
+            cert.set_issuer_name(&name).unwrap();
+            cert.set_pubkey(&key).unwrap();
+            cert.set_not_before(Asn1Time::days_from_now(0).unwrap().as_ref())
+                .unwrap();
+            cert.set_not_after(Asn1Time::days_from_now(1).unwrap().as_ref())
+                .unwrap();
+            cert.sign(&key, MessageDigest::sha256()).unwrap();
+            builder.set_certificate(&cert.build()).unwrap();
+            builder.set_private_key(&key).unwrap();
+            let ssl = Ssl::new(&builder.build()).unwrap();
+            let mut tls = SslStream::new(ssl, sock).unwrap();
+            tls.accept().unwrap();
+            let mut byte = [0];
+            assert_eq!(tls.read(&mut byte).unwrap(), 0, "credentials were sent");
+        });
+        let mut request = request_for(port);
+        request.encryption = EncryptionMode::Unverified;
+        request.username = Some("test-user".into());
+        request.password = Some("test-password".into());
+        request.certificate_pin = old_pin.clone();
+        let handle = SessionHandle::spawn(request);
+        assert!(wait_for(&handle, Duration::from_secs(5), |event| {
+            match event {
+                SessionEvent::CertificateTrustRequired {
+                    fingerprint,
+                    previous,
+                } => {
+                    assert_eq!(fingerprint.len(), 64);
+                    assert_ne!(fingerprint, "A".repeat(64).as_str());
+                    assert_eq!(previous.as_ref(), old_pin.as_ref());
+                    true
+                }
+                SessionEvent::Error(error) => panic!("unexpected error: {error}"),
+                _ => false,
+            }
+        }));
+        server.join().unwrap();
+    }
 }
 
 fn assert_ard_rejected(username: Option<&str>, password: Option<&str>, expected: &str) {

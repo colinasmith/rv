@@ -19,6 +19,6 @@ pub use keysym::{
 };
 pub use prefs::{Preferences, ThemePref};
 pub use store::{
-    AddressBook, StoreError, StorePaths, delete_password, load_password, password_key,
-    save_password,
+    AddressBook, StoreError, StorePaths, delete_password, load_certificate_pin, load_password,
+    password_key, save_certificate_pin, save_password,
 };
