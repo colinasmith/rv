@@ -15,7 +15,7 @@ A native desktop VNC viewer written in Rust with [GPUI](https://www.gpui.rs/). D
 - Clipboard sync (Latin-1, per RFB)
 - VNC Auth, Tight / ZRLE / TRLE / Raw encodings
 - Mac Screen Sharing / Apple Remote Desktop (ARD) login using the **Username** and **Password** fields in connection properties. ARD encrypts credentials, but requires no legacy VNC password setting on the Mac. Use **Let server choose**; **Always on** still requires VeNCrypt session TLS.
-- VeNCrypt TLS: `TLSVnc` / `TLSNone` (anonymous TLS, TigerVNC's default) via OpenSSL, `X509Vnc` / `X509None` via rustls with WebPKI roots. `Let server choose` picks encryption automatically when the server offers nothing else
+- VeNCrypt TLS: `TLSVnc` / `TLSNone` use anonymous TLS via OpenSSL; `X509Vnc` / `X509None` / `X509Plain` use certificate verification through rustls with WebPKI roots by default. `X509Plain` uses the Username and Password fields. For a server with an untrusted self-signed certificate, **Unverified X509Plain** explicitly encrypts the connection without verifying the server's identity. An attacker between the viewer and server could intercept login credentials in this mode. `Let server choose` picks encryption automatically when the server offers nothing else
 - Passwords stored in the OS keychain
 - Touch ID for saved passwords in signed macOS builds (with macOS password fallback)
 

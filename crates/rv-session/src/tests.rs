@@ -11,15 +11,15 @@ use rv_core::{ConnectRequest, EncryptionMode, QualityPreset};
 
 use crate::{SessionEvent, SessionHandle, coalesce_frames};
 
-fn write_u16(s: &mut TcpStream, v: u16) {
+fn write_u16(s: &mut impl Write, v: u16) {
     s.write_all(&v.to_be_bytes()).unwrap();
 }
 
-fn write_u32(s: &mut TcpStream, v: u32) {
+fn write_u32(s: &mut impl Write, v: u32) {
     s.write_all(&v.to_be_bytes()).unwrap();
 }
 
-fn read_exact(s: &mut TcpStream, n: usize) -> Vec<u8> {
+fn read_exact(s: &mut impl Read, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     s.read_exact(&mut buf).unwrap();
     buf
@@ -35,7 +35,7 @@ fn rfb_handshake(sock: &mut TcpStream, width: u16, height: u16, name: &[u8]) {
     rfb_server_init(sock, width, height, name);
 }
 
-fn rfb_server_init(sock: &mut TcpStream, width: u16, height: u16, name: &[u8]) {
+fn rfb_server_init(sock: &mut (impl Read + Write), width: u16, height: u16, name: &[u8]) {
     assert_eq!(read_exact(sock, 1), [1], "expected shared ClientInit");
 
     write_u16(sock, width);
@@ -53,14 +53,14 @@ fn rfb_server_init(sock: &mut TcpStream, width: u16, height: u16, name: &[u8]) {
 /// Minimal RFB 3.8 server: None auth, 8×8 Raw framebuffer, then echo input.
 fn mock_rfb_server(mut sock: TcpStream) {
     rfb_handshake(&mut sock, 8, 8, b"test");
+    sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
     mock_rfb_messages(sock);
 }
 
-fn mock_rfb_messages(mut sock: TcpStream) -> bool {
+fn mock_rfb_messages(mut sock: impl Read + Write) -> bool {
     let mut saw_pointer = false;
     let mut saw_key = false;
     let mut sent_frame = false;
-    sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
 
     loop {
         let mut typ = [0u8; 1];
@@ -415,6 +415,88 @@ fn ard_authentication_frame_and_input() {
     handle.pointer(1, 1, 1);
     handle.key(0xff0d, true);
     handle.key(0xff0d, false);
+    server.join().unwrap();
+    handle.close();
+}
+
+/// Exercise X509Plain against a self-signed server, including the replayed RFB
+/// greeting, framebuffer updates, and later input messages.
+#[test]
+fn x509_plain_unverified_authentication_frame_and_input() {
+    use openssl::asn1::Asn1Time;
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+    use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream};
+    use openssl::x509::{X509, X509NameBuilder};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        sock.write_all(b"RFB 003.008\n").unwrap();
+        assert_eq!(read_exact(&mut sock, 12), b"RFB 003.008\n");
+        sock.write_all(&[1, 19, 0, 2]).unwrap();
+        assert_eq!(read_exact(&mut sock, 1), [19]);
+        assert_eq!(read_exact(&mut sock, 2), [0, 2]);
+        sock.write_all(&[0, 2]).unwrap();
+        write_u32(&mut sock, 259);
+        write_u32(&mut sock, 262);
+        assert_eq!(read_exact(&mut sock, 4), 262u32.to_be_bytes());
+        sock.write_all(&[1]).unwrap();
+
+        let mut builder = SslContext::builder(SslMethod::tls_server()).unwrap();
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "self-signed").unwrap();
+        let name = name.build();
+        let mut cert = X509::builder().unwrap();
+        cert.set_version(2).unwrap();
+        cert.set_subject_name(&name).unwrap();
+        cert.set_issuer_name(&name).unwrap();
+        cert.set_pubkey(&key).unwrap();
+        cert.set_not_before(Asn1Time::days_from_now(0).unwrap().as_ref())
+            .unwrap();
+        cert.set_not_after(Asn1Time::days_from_now(1).unwrap().as_ref())
+            .unwrap();
+        cert.sign(&key, MessageDigest::sha256()).unwrap();
+        builder.set_certificate(&cert.build()).unwrap();
+        builder.set_private_key(&key).unwrap();
+        let ssl = Ssl::new(&builder.build()).unwrap();
+        let mut tls = SslStream::new(ssl, sock).unwrap();
+        tls.accept().unwrap();
+
+        let username_len = u32::from_be_bytes(read_exact(&mut tls, 4).try_into().unwrap());
+        let password_len = u32::from_be_bytes(read_exact(&mut tls, 4).try_into().unwrap());
+        assert_eq!(read_exact(&mut tls, username_len as usize), b"test-user");
+        assert_eq!(
+            read_exact(&mut tls, password_len as usize),
+            b"test-password"
+        );
+        write_u32(&mut tls, 0);
+        rfb_server_init(&mut tls, 8, 8, b"Plain mock");
+        assert!(mock_rfb_messages(tls), "expected framebuffer and input");
+    });
+    let mut request = request_for(port);
+    request.encryption = EncryptionMode::Unverified;
+    request.username = Some("test-user".into());
+    request.password = Some("test-password".into());
+    let handle = SessionHandle::spawn(request);
+    assert!(
+        wait_for(&handle, Duration::from_secs(5), |event| {
+            if let SessionEvent::Error(error) = event {
+                panic!("Plain connection failed: {error}");
+            }
+            matches!(event, SessionEvent::FrameReady { .. })
+                && handle.framebuffer.lock().unwrap().pixels.get(..4) == Some(&[0, 80, 200, 255])
+        }),
+        "expected authenticated desktop frame"
+    );
+    handle.pointer(1, 1, 1);
+    handle.key(0xff0d, true);
     server.join().unwrap();
     handle.close();
 }

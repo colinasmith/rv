@@ -273,8 +273,10 @@ fn choose_transport(
             .join(", ")
     };
     match mode {
-        EncryptionMode::Always if vencrypt_ok => Ok(Transport::VeNCrypt),
-        EncryptionMode::Always => Err(SessionError::msg(format!(
+        EncryptionMode::Always | EncryptionMode::Unverified if vencrypt_ok => {
+            Ok(Transport::VeNCrypt)
+        }
+        EncryptionMode::Always | EncryptionMode::Unverified => Err(SessionError::msg(format!(
             "server does not offer VeNCrypt (offers: {}); set Encryption to Let server choose to connect unencrypted",
             offered()
         ))),
@@ -324,7 +326,18 @@ async fn connect(
         }
         Transport::VeNCrypt => {
             send(SessionEvent::Status("Negotiating VeNCrypt…".into()));
-            vencrypt::handshake(tcp, &request.host).await?
+            timeout(
+                CONNECT_TIMEOUT,
+                vencrypt::handshake(
+                    tcp,
+                    &request.host,
+                    request.username.as_deref(),
+                    request.password.as_deref(),
+                    request.encryption == EncryptionMode::Unverified,
+                ),
+            )
+            .await
+            .map_err(|_| SessionError::Timeout)??
         }
     };
 
@@ -497,6 +510,11 @@ mod transport_tests {
             Transport::Plain
         );
         assert!(choose_transport(EncryptionMode::Always, &[2], false).is_err());
+        assert!(choose_transport(EncryptionMode::Unverified, &[2], false).is_err());
+        assert_eq!(
+            choose_transport(EncryptionMode::Unverified, &[19], true).unwrap(),
+            Transport::VeNCrypt
+        );
     }
 
     #[test]
@@ -525,6 +543,7 @@ mod transport_tests {
             );
         }
         assert!(choose_transport(EncryptionMode::Always, &types, true).is_err());
+        assert!(choose_transport(EncryptionMode::Unverified, &types, true).is_err());
         assert_eq!(
             choose_transport(EncryptionMode::LetServerChoose, &[2, 30], true).unwrap(),
             Transport::Ard

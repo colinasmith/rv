@@ -1482,7 +1482,11 @@ fn connection_options(app: &AddressBookApp, cx: &mut Context<AddressBookApp>) ->
                 .outline()
                 .small()
                 .label(app.encryption.label())
-                .tooltip("Click to cycle")
+                .tooltip(if app.encryption == EncryptionMode::Unverified {
+                    "Unverified X509Plain encrypts traffic without verifying the server. Click to cycle."
+                } else {
+                    "Click to cycle"
+                })
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.encryption = this.encryption.cycle();
                     cx.notify();

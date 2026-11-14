@@ -30,6 +30,9 @@ const TLS_NONE: u32 = 257;
 const TLS_VNC: u32 = 258;
 const X509_NONE: u32 = 260;
 const X509_VNC: u32 = 261;
+const X509_PLAIN: u32 = 262;
+const MAX_CREDENTIAL_BYTES: usize = 4096;
+const MAX_FAILURE_BYTES: u32 = 4096;
 
 const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
 
@@ -37,6 +40,7 @@ const RFB_VERSION: &[u8; 12] = b"RFB 003.008\n";
 pub enum VencryptAuth {
     None,
     Vnc,
+    Plain,
 }
 
 impl VencryptAuth {
@@ -44,6 +48,7 @@ impl VencryptAuth {
         match self {
             Self::None => SEC_NONE,
             Self::Vnc => SEC_VNC_AUTH,
+            Self::Plain => SEC_NONE,
         }
     }
 }
@@ -90,6 +95,7 @@ enum Transport {
     Plain(TcpStream),
     Verified(Box<tokio_rustls::client::TlsStream<TcpStream>>),
     Anonymous(Box<tokio_openssl::SslStream<TcpStream>>),
+    UnverifiedCert(Box<tokio_openssl::SslStream<TcpStream>>),
 }
 
 /// Stream handed to `vnc-rs`.
@@ -124,7 +130,11 @@ impl RfbStream {
     /// ARD has already checked the real SecurityResult. Replay success only
     /// after that check: vnc-rs does not validate the result for None auth.
     pub(crate) fn authenticated(stream: TcpStream) -> Self {
-        let mut result = Self::negotiated(Transport::Plain(stream), VencryptAuth::None);
+        Self::authenticated_transport(Transport::Plain(stream))
+    }
+
+    fn authenticated_transport(inner: Transport) -> Self {
+        let mut result = Self::negotiated(inner, VencryptAuth::None);
         result.prefix.extend_from_slice(&0u32.to_be_bytes());
         result
     }
@@ -145,6 +155,7 @@ impl RfbStream {
             Transport::Plain(s) => Pin::new(s).poll_flush(cx),
             Transport::Verified(s) => Pin::new(s.as_mut()).poll_flush(cx),
             Transport::Anonymous(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            Transport::UnverifiedCert(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 }
@@ -179,6 +190,7 @@ impl AsyncRead for RfbStream {
             Transport::Plain(s) => Pin::new(s).poll_read(cx, buf),
             Transport::Verified(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
             Transport::Anonymous(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            Transport::UnverifiedCert(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -198,6 +210,9 @@ impl AsyncWrite for RfbStream {
             Transport::Plain(s) => std::task::ready!(Pin::new(s).poll_write(cx, buf)),
             Transport::Verified(s) => std::task::ready!(Pin::new(s.as_mut()).poll_write(cx, buf)),
             Transport::Anonymous(s) => std::task::ready!(Pin::new(s.as_mut()).poll_write(cx, buf)),
+            Transport::UnverifiedCert(s) => {
+                std::task::ready!(Pin::new(s.as_mut()).poll_write(cx, buf))
+            }
         }?;
         // Push the bytes to the socket now. vnc-rs writes control messages
         // (key, pointer) without ever flushing, and a TLS stream buffers them
@@ -212,6 +227,7 @@ impl AsyncWrite for RfbStream {
             Transport::Plain(s) => Pin::new(s).poll_flush(cx),
             Transport::Verified(s) => Pin::new(s.as_mut()).poll_flush(cx),
             Transport::Anonymous(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            Transport::UnverifiedCert(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
@@ -220,6 +236,7 @@ impl AsyncWrite for RfbStream {
             Transport::Plain(s) => Pin::new(s).poll_shutdown(cx),
             Transport::Verified(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
             Transport::Anonymous(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            Transport::UnverifiedCert(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -231,8 +248,14 @@ unsafe impl Sync for RfbStream {}
 
 /// Run the VeNCrypt sub-handshake on a socket whose security list offered
 /// type 19, then bring up TLS. Returns a stream ready for `vnc-rs` to
-/// perform None / VncAuth on.
-pub async fn handshake(mut stream: TcpStream, host: &str) -> Result<RfbStream, SessionError> {
+/// perform None / VncAuth on, or after completing Plain authentication.
+pub async fn handshake(
+    mut stream: TcpStream,
+    host: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    unverified: bool,
+) -> Result<RfbStream, SessionError> {
     stream.write_u8(VENCRYPT_SECURITY_TYPE).await?;
 
     let major = stream.read_u8().await?;
@@ -258,11 +281,27 @@ pub async fn handshake(mut stream: TcpStream, host: &str) -> Result<RfbStream, S
         subtypes.push(stream.read_u32().await?);
     }
 
-    let (chosen, auth, x509) = pick_subtype(&subtypes).ok_or_else(|| {
-        SessionError::msg(format!(
-            "no supported VeNCrypt subtype in {subtypes:?} (want TLSVnc / TLSNone / X509Vnc / X509None)"
-        ))
-    })?;
+    let (chosen, auth, x509) = if unverified {
+        validate_plain_credentials(username, password)?;
+        if !subtypes.contains(&X509_PLAIN) {
+            return Err(SessionError::msg("server does not offer X509Plain"));
+        }
+        (X509_PLAIN, VencryptAuth::Plain, true)
+    } else {
+        pick_subtype(&subtypes, username.is_some_and(|s| !s.is_empty())).ok_or_else(|| {
+            if subtypes.contains(&X509_PLAIN) {
+                SessionError::msg("X509Plain requires a username and password")
+            } else {
+                SessionError::msg(format!(
+                    "no supported VeNCrypt subtype in {subtypes:?} (supported: X509Plain / TLSVnc / TLSNone / X509Vnc / X509None)"
+                ))
+            }
+        })?
+    };
+
+    if auth == VencryptAuth::Plain {
+        validate_plain_credentials(username, password)?;
+    }
 
     stream.write_u32(chosen).await?;
     let accept = stream.read_u8().await?;
@@ -272,17 +311,27 @@ pub async fn handshake(mut stream: TcpStream, host: &str) -> Result<RfbStream, S
         ));
     }
 
-    let transport = if x509 {
+    let mut transport = if x509 && !unverified {
         Transport::Verified(Box::new(verified_tls(stream, host).await?))
+    } else if x509 {
+        Transport::UnverifiedCert(Box::new(unverified_cert_tls(stream, host).await?))
     } else {
         Transport::Anonymous(Box::new(anonymous_tls(stream).await?))
     };
-    Ok(RfbStream::negotiated(transport, auth))
+    if auth == VencryptAuth::Plain {
+        plain_auth(&mut transport, username.unwrap(), password.unwrap()).await?;
+        Ok(RfbStream::authenticated_transport(transport))
+    } else {
+        Ok(RfbStream::negotiated(transport, auth))
+    }
 }
 
-/// Choose the VeNCrypt subtype: keep VncAuth over None, and prefer a
-/// certificate when the server has one.
-fn pick_subtype(available: &[u32]) -> Option<(u32, VencryptAuth, bool)> {
+/// With a username, prefer Plain. Otherwise keep VncAuth over None. Within
+/// each authentication method, prefer an X509 subtype.
+fn pick_subtype(available: &[u32], has_username: bool) -> Option<(u32, VencryptAuth, bool)> {
+    if has_username && available.contains(&X509_PLAIN) {
+        return Some((X509_PLAIN, VencryptAuth::Plain, true));
+    }
     const PREF: [(u32, VencryptAuth, bool); 4] = [
         (X509_VNC, VencryptAuth::Vnc, true),
         (TLS_VNC, VencryptAuth::Vnc, false),
@@ -295,6 +344,78 @@ fn pick_subtype(available: &[u32]) -> Option<(u32, VencryptAuth, bool)> {
         }
     }
     None
+}
+
+fn validate_plain_credentials(
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<(), SessionError> {
+    let (Some(username), Some(password)) = (username, password) else {
+        return Err(SessionError::msg(
+            "VeNCrypt Plain requires a username and password",
+        ));
+    };
+    if username.is_empty() {
+        return Err(SessionError::msg("VeNCrypt Plain requires a username"));
+    }
+    if password.is_empty() {
+        return Err(SessionError::msg("VeNCrypt Plain requires a password"));
+    }
+    for (label, value) in [("username", username), ("password", password)] {
+        if value.len() > MAX_CREDENTIAL_BYTES || value.contains('\0') {
+            return Err(SessionError::msg(format!(
+                "VeNCrypt Plain {label} must be at most {MAX_CREDENTIAL_BYTES} UTF-8 bytes and contain no NUL"
+            )));
+        }
+        u32::try_from(value.len())
+            .map_err(|_| SessionError::msg("VeNCrypt Plain credential is too long"))?;
+    }
+    Ok(())
+}
+
+async fn plain_auth(
+    transport: &mut Transport,
+    username: &str,
+    password: &str,
+) -> Result<(), SessionError> {
+    match transport {
+        Transport::Plain(s) => plain_auth_stream(s, username, password).await,
+        Transport::Verified(s) => plain_auth_stream(s.as_mut(), username, password).await,
+        Transport::Anonymous(s) => plain_auth_stream(s.as_mut(), username, password).await,
+        Transport::UnverifiedCert(s) => plain_auth_stream(s.as_mut(), username, password).await,
+    }
+}
+
+async fn plain_auth_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    username: &str,
+    password: &str,
+) -> Result<(), SessionError> {
+    stream.write_u32(username.len() as u32).await?;
+    stream.write_u32(password.len() as u32).await?;
+    stream.write_all(username.as_bytes()).await?;
+    stream.write_all(password.as_bytes()).await?;
+    stream.flush().await?;
+    let result = stream.read_u32().await?;
+    if result == 0 {
+        return Ok(());
+    }
+    // RFB failures use status 1 followed by a length. x11vnc's Plain
+    // failure instead sends the string length directly.
+    let length = if result == 1 {
+        stream.read_u32().await?
+    } else {
+        result
+    };
+    if length > MAX_FAILURE_BYTES {
+        return Err(SessionError::msg("VeNCrypt Plain login was rejected"));
+    }
+    let mut reason = vec![0; length as usize];
+    stream.read_exact(&mut reason).await?;
+    Err(SessionError::msg(format!(
+        "VeNCrypt Plain login was rejected: {}",
+        String::from_utf8_lossy(&reason)
+    )))
 }
 
 /// `X509*`: rustls, server certificate checked against the WebPKI roots.
@@ -314,6 +435,26 @@ async fn verified_tls(
         .connect(server_name, stream)
         .await
         .map_err(|e| SessionError::Tls(e.to_string()))
+}
+
+/// `X509*` with explicit unverified TLS: encrypt without checking the server
+/// certificate. This has the same server identity guarantee as anonymous TLS.
+async fn unverified_cert_tls(
+    stream: TcpStream,
+    host: &str,
+) -> Result<tokio_openssl::SslStream<TcpStream>, SessionError> {
+    let mut builder = SslContext::builder(SslMethod::tls_client())?;
+    builder.set_verify(SslVerifyMode::NONE);
+    let mut ssl = Ssl::new(&builder.build())?;
+    if host.parse::<std::net::IpAddr>().is_err() {
+        ssl.set_hostname(host)?;
+    }
+    let mut tls = tokio_openssl::SslStream::new(ssl, stream)?;
+    Pin::new(&mut tls)
+        .connect()
+        .await
+        .map_err(|e| SessionError::Tls(format!("unverified TLS handshake failed: {e}")))?;
+    Ok(tls)
 }
 
 /// `TLS*`: anonymous Diffie-Hellman through OpenSSL.
@@ -345,11 +486,68 @@ mod tests {
 
     #[test]
     fn prefers_x509_over_anonymous_tls() {
-        let (id, auth, x509) = pick_subtype(&[TLS_VNC, X509_VNC]).unwrap();
+        let (id, auth, x509) = pick_subtype(&[TLS_VNC, X509_VNC], false).unwrap();
         assert_eq!((id, auth, x509), (X509_VNC, VencryptAuth::Vnc, true));
-        let (id, auth, x509) = pick_subtype(&[TLS_NONE, TLS_VNC]).unwrap();
+        let (id, auth, x509) = pick_subtype(&[TLS_NONE, TLS_VNC], false).unwrap();
         assert_eq!((id, auth, x509), (TLS_VNC, VencryptAuth::Vnc, false));
-        assert!(pick_subtype(&[999]).is_none());
+        assert!(pick_subtype(&[999], false).is_none());
+        assert_eq!(
+            pick_subtype(&[X509_PLAIN], true),
+            Some((X509_PLAIN, VencryptAuth::Plain, true))
+        );
+        assert_eq!(pick_subtype(&[X509_PLAIN], false), None);
+        assert_eq!(
+            pick_subtype(&[TLS_NONE, X509_VNC], false),
+            Some((X509_VNC, VencryptAuth::Vnc, true))
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_auth_frames_credentials_and_checks_success() {
+        let (mut client, mut server) = tokio::io::duplex(128);
+        let peer = tokio::spawn(async move {
+            assert_eq!(server.read_u32().await.unwrap(), 5);
+            assert_eq!(server.read_u32().await.unwrap(), 6);
+            let mut bytes = [0u8; 11];
+            server.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"alicesecret");
+            server.write_u32(0).await.unwrap();
+        });
+        plain_auth_stream(&mut client, "alice", "secret")
+            .await
+            .unwrap();
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plain_auth_rejects_standard_and_x11vnc_failures() {
+        for x11vnc in [false, true] {
+            let (mut client, mut server) = tokio::io::duplex(128);
+            let peer = tokio::spawn(async move {
+                let len = server.read_u32().await.unwrap() + server.read_u32().await.unwrap();
+                let mut credentials = vec![0; len as usize];
+                server.read_exact(&mut credentials).await.unwrap();
+                if !x11vnc {
+                    server.write_u32(1).await.unwrap();
+                }
+                server.write_u32(13).await.unwrap();
+                server.write_all(b"unixpw failed").await.unwrap();
+            });
+            let error = plain_auth_stream(&mut client, "alice", "bad")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("unixpw failed"));
+            peer.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn plain_credentials_are_bounded() {
+        assert!(validate_plain_credentials(None, Some("secret")).is_err());
+        assert!(validate_plain_credentials(Some("alice"), None).is_err());
+        assert!(validate_plain_credentials(Some("alice"), Some("")).is_err());
+        assert!(validate_plain_credentials(Some("alice\0bob"), Some("secret")).is_err());
+        assert!(validate_plain_credentials(Some("alice"), Some(&"a".repeat(4097))).is_err());
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub enum EncryptionMode {
     PreferOn,
     /// Require VeNCrypt TLS.
     Always,
+    /// Require VeNCrypt TLS without server certificate verification.
+    Unverified,
     /// Never use VeNCrypt.
     Off,
 }
@@ -43,6 +45,7 @@ impl EncryptionMode {
             Self::LetServerChoose => "Let server choose",
             Self::PreferOn => "Prefer on",
             Self::Always => "Always on",
+            Self::Unverified => "Unverified X509Plain",
             Self::Off => "Off",
         }
     }
@@ -51,7 +54,8 @@ impl EncryptionMode {
         match self {
             Self::LetServerChoose => Self::PreferOn,
             Self::PreferOn => Self::Always,
-            Self::Always => Self::Off,
+            Self::Always => Self::Unverified,
+            Self::Unverified => Self::Off,
             Self::Off => Self::LetServerChoose,
         }
     }
@@ -344,11 +348,13 @@ mod tests {
 
     #[test]
     fn connection_round_trip() {
-        let c = Connection::new("office", "10.0.0.8", 5900);
+        let mut c = Connection::new("office", "10.0.0.8", 5900);
+        c.encryption = EncryptionMode::Unverified;
         let json = serde_json::to_string(&c).unwrap();
         let back: Connection = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "office");
         assert_eq!(back.port, 5900);
         assert!(back.shared);
+        assert_eq!(back.encryption, EncryptionMode::Unverified);
     }
 }
