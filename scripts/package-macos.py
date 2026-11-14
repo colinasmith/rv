@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--version", default="0.2.0")
+    parser.add_argument("--bundle-id", default="io.github.madeye.rv", help="App bundle identifier (default: %(default)s)")
     parser.add_argument("--identity", help="Developer ID Application signing identity")
     parser.add_argument("--profile", type=Path, help="Matching Developer ID provisioning profile")
     args = parser.parse_args()
@@ -25,7 +26,7 @@ def main():
     if args.output.suffix != ".app" or args.output.exists():
         parser.error("--output must name a new .app bundle")
 
-    bundle_id = "io.github.madeye.rv"
+    bundle_id = args.bundle_id
     entitlements = None
     if args.profile:
         profile = plistlib.loads(subprocess.check_output([
@@ -34,7 +35,7 @@ def main():
         allowed = profile["Entitlements"]
         app_id = allowed["com.apple.application-identifier"]
         if app_id.split(".", 1)[1] != bundle_id:
-            parser.error("the profile must belong to io.github.madeye.rv")
+            parser.error(f"the profile must belong to {bundle_id}")
         if profile["ExpirationDate"] <= datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None):
             parser.error("the provisioning profile has expired")
         if "OSX" not in profile.get("Platform", []) or not profile.get("ProvisionsAllDevices"):
